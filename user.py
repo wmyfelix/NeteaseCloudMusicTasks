@@ -40,12 +40,12 @@ class User(object):
             return str(data)
 
     def setUser(self, user_config, user_setting):
-        if len(user_config['username']) == 0:
-            self.title += ': 请填写账号密码'
+        if len(user_config['username']) == 0 and len(user_config['cookie']) == 0:
+            self.title += ': 请填写账号密码或cookie'
             self.taskTitle('用户信息')
-            self.taskInfo('登录失败，请填写账号密码')
-            raise Exception('请填写账号密码')
-        self.music = self.login_check(user_config['username'], user_config['password'], user_config.get(
+            self.taskInfo('登录失败，请填写账号密码或cookie')
+            raise Exception('请填写账号密码或cookie')
+        self.music = self.login_check(user_config['username'], user_config['password'], user_config['cookie'], user_config.get(
             'countrycode', ''), user_config['X-Real-IP'])
         if self.music.uid != 0:
             self.isLogined = True
@@ -61,25 +61,55 @@ class User(object):
             self.taskTitle('用户信息')
             self.taskInfo('登录失败，' + msg)
             self.finishTask()
+    def set_cookies(self, cookie, music):
+        cookies = {}
+        sp = cookie.split(";")
+        cookies = {}
+        for c in sp:
+            t = []
+            if ':' in c:
+                t = c.split(':')
+            elif '=' in c:
+                t = c.split('=')
+            if len(t) == 2:
+                cookies[t[0]] = t[1]
+        if len(cookies) > 0:
+            cookies['__remember_me'] = 'true'
+            for key, value in cookies.items():
+                c = music.make_cookie(key, value)
+                music.session.cookies.set_cookie(c)
 
-    def login_check(self, username, pwd='', countrycode='', ip=''):
+    def login_check(self, username, pwd='', cookie='', countrycode='', ip=''):
         music = NetEase(username)
         if len(ip) > 0:
             music.header["X-Real-IP"] = ip
+
+        if len(cookie) > 0:
+            self.set_cookies(cookie, music)
+            resp = music.user_level()
+            if resp['code'] == 200:
+                print('已通过配置文件中的 cookie 登录')
+                music.uid = resp['data']['userId']
+                user_resp = music.user_detail(music.uid)
+                if 'artistId' in user_resp['profile']:
+                    self.artistId = user_resp['profile']['artistId']
+                self.listenSongs = user_resp['listenSongs']
+                music.nickname = user_resp['profile']['nickname']
+                music.userType = user_resp['profile']['userType']
+                if music.userType != 0 and music.userType != 4:
+                    for authtype in user_resp['profile'].get('allAuthTypes', []):
+                        if authtype['type'] == 4:
+                            music.userType = 4
+                            break
+                return music
+            else:
+                print('配置文件中的 cookie 填写错误或已失效')
+                music.session.cookies.clear()
+
         if self.runtime == 'tencent-scf':
             var_name = 'COOKIE_' + re.sub('[^a-zA-Z0-9]', '_', username)
             if var_name in os.environ:
-                sp = os.environ.get(var_name).split(";")
-                cookies = {}
-                for c in sp:
-                    t = c.split(':')
-                    if len(t) == 2:
-                        cookies[t[0]] = t[1]
-                if len(cookies) > 0:
-                    music.session = requests.Session()
-                    cookies['__remember_me'] = 'true'
-                    requests.utils.add_dict_to_cookiejar(
-                        music.session.cookies, cookies)
+                self.set_cookies(os.environ.get(var_name), music)
         resp = music.user_level()
         if resp['code'] == 200:
             print('已通过 cookie 登录')
@@ -103,6 +133,12 @@ class User(object):
                 return music
             login_resp = music.login(username, pwd, countrycode)
             if login_resp['code'] == 200:
+                time.sleep(3)
+                level_resp = music.user_level()
+                if level_resp['code'] == 301:
+                    music.loginerror = str(login_resp['profile']['userId']) + ' 运行失败，请尝试删除云函数后重新部署'
+                    music.uid = 0
+                    return music
                 print('已通过账号密码登录')                
                 if self.runtime == 'tencent-scf':
                     music_cookie = ''
@@ -131,25 +167,27 @@ class User(object):
                 music.nickname = ''
                 if login_resp['code'] == -1:
                     music.loginerror = ''
+                elif login_resp['code'] == -462:
+                    music.loginerror = '暂时无法通过账号密码登录，请在配置文件中填写 cookie 进行登录'
                 else:
                     music.loginerror = login_resp.get('msg', str(login_resp))
 
         return music
 
     def taskTitle(self, title):
-        msg = '**{}**\n'.format(title)
-        self.msg += msg + '\n'
-        print(msg)
-    def taskInfo(self, key, value='', useCodeblock = True):
+        self.msg += '#### ' + title + '\n'
+        print('【' + title + '】')
+
+    def taskInfo(self, key, value='', useCodeblock=True):
         if value == '':
-            msg = f"\t{str(key)}"
+            self.msg += '- ' + str(key) + '\n'
+            print('    • ' + str(key))
         elif useCodeblock:
-            # Use `codeblock` to prevent markdown 's keywords containing in value which leads to 400 Bad Request
-            msg = f"\t{str(key)}: `{str(value)}`"
+            self.msg += '- ' + str(key) + ': `' + str(value) + '`\n'
+            print('    • ' + str(key) + ': ' + str(value))
         else:
-            msg = f"\t{str(key)}: {str(value)}"
-        self.msg += msg + '\n'
-        print(msg)
+            self.msg += '- ' + str(key) + ': ' + str(value) + '\n'
+            print('    • ' + str(key) + ': ' + str(value))
 
 
     def finishTask(self):
@@ -171,10 +209,9 @@ class User(object):
 
         if self.vipType == 11:
             vip_resp = self.music.vip_level()
-            if 'data' in vip_resp:
-                self.taskInfo('VIP等级', vip_resp['data']['redVipLevel'])
-                self.taskInfo('到期时间', time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(vip_resp['data']['musicPackage']['expireTime']/1000)))
+            self.taskInfo('VIP等级', vip_resp['data']['redVipLevel'])
+            self.taskInfo('到期时间', time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(vip_resp['data']['musicPackage']['expireTime']/1000)))
 
         self.taskInfo('云贝数量', resp['userPoint']['balance'])
 
@@ -190,21 +227,14 @@ class User(object):
         self.taskInfo('歌单总收藏数', resp['profile']['playlistBeSubscribedCount'])
 
         resp = self.music.user_level()
-        if 'full' in resp:
-            self.full = resp['full']
-        else:
-            if 'data' in resp and 'level' in resp['data']:
-                self.full = (resp['data']['level'] == 10)
-            else:
-                print('获取用户等级失败:' + str(resp))
-        if 'data' in resp:
-            if not self.full:
-                self.taskInfo('距离下级还需播放', str(
-                    resp['data']['nextPlayCount'] - resp['data']['nowPlayCount']) + '首歌')
-                self.taskInfo('距离下级还需登录', str(
-                    resp['data']['nextLoginCount'] - resp['data']['nowLoginCount']) + '天')
-                if resp['data']['nowPlayCount'] >= 20000:
-                    self.songFull = True
+        self.full = resp['full']
+        if not self.full:
+            self.taskInfo('距离下级还需播放', str(
+                resp['data']['nextPlayCount'] - resp['data']['nowPlayCount']) + '首歌')
+            self.taskInfo('距离下级还需登录', str(
+                resp['data']['nextLoginCount'] - resp['data']['nowLoginCount']) + '天')
+            if resp['data']['nowPlayCount'] >= 20000:
+                self.songFull = True
         self.finishTask()
 
     def resize(self, total):
@@ -300,7 +330,7 @@ class User(object):
                 self.taskInfo('听歌总数', str(resp['listenSongs']) + '首')
                 if resp['listenSongs'] - self.songnumber < 300:
                     self.taskInfo(
-                        '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', useCodeblock=False)
+                        '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', False)
                 return
             else:
                 total = 300 - (resp['listenSongs'] - self.songnumber)
@@ -321,7 +351,7 @@ class User(object):
         self.taskInfo('听歌总数', str(resp['listenSongs']) + '首')
         if resp['listenSongs'] - self.songnumber < 300:
             self.taskInfo(
-                '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', useCodeblock=False)
+                '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', False)
         self.finishTask()
 
     def daka(self):
@@ -385,7 +415,7 @@ class User(object):
                 self.taskInfo('听歌总数', str(resp['listenSongs']) + '首')
                 if resp['listenSongs'] - self.listenSongs < 300:
                     self.taskInfo(
-                        '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', useCodeblock=False)
+                        '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', False)
                 return
 
         time.sleep(user_setting['daka']['sleep_time'] + 5)
@@ -398,7 +428,7 @@ class User(object):
         self.taskInfo('听歌总数', str(resp['listenSongs']) + '首')
         if resp['listenSongs'] - self.listenSongs < 300:
             self.taskInfo(
-                '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', useCodeblock=False)
+                '温馨提示', '数据更新可能有延时，[点击查看最新数据](https://music.163.com/#/user/home?id='+str(self.uid)+')', False)
         self.finishTask()
 
     def play_playlists(self):
@@ -486,6 +516,8 @@ class User(object):
             time.sleep(sleep_time)
 
     def follow(self):
+        # 转载注明来源: https://github.com/chen310/NeteaseCloudMusicTasks
+        # 勿修改作者 ID
         author_uid = 347837981
         if self.uid == author_uid:
             return
@@ -498,7 +530,7 @@ class User(object):
                 self.taskInfo('感谢关注', author_nickname)
                 # self.taskInfo('如果不想关注，请在配置文件里修改，并在官方客户端里取消关注')
                 self.taskInfo(
-                    '如果不想关注，请在配置文件里修改，并在[主页](https://music.163.com/#/user/home?id='+str(author_uid)+')里取消关注', useCodeblock=False)
+                    '如果不想关注，请在配置文件里修改，并在[主页](https://music.163.com/#/user/home?id='+str(author_uid)+')里取消关注', False)
                 self.finishTask()
 
     def sign(self):
@@ -546,12 +578,20 @@ class User(object):
 
     def get_missions(self):
         cycle_result = self.music.mission_cycle_get()
+        if cycle_result['code'] != 200:
+            time.sleep(0.2)
+            cycle_result = self.music.mission_cycle_get()
         time.sleep(0.5)
         stage_result = self.music.mission_stage_get()
+        if stage_result['code'] != 200:
+            time.sleep(0.2)
+            stage_result = self.music.mission_stage_get()
 
         missions = []
         if cycle_result['code'] == 200:
             missions.extend(cycle_result.get('data', {}).get('list', []))
+        else:
+            print('每日任务获取失败:', self.errMsg(cycle_result))
         if stage_result['code'] == 200:
             for mission in stage_result['data']['list']:
                 for target in  mission['userStageTargetList']:
@@ -563,7 +603,8 @@ class User(object):
                     if 'userMissionId' in target:
                         m['userMissionId'] = target['userMissionId']
                     missions.append(m)
-
+        else:
+            print('每周任务获取失败:', self.errMsg(stage_result))
         return missions
 
     def musician_task(self):
@@ -600,7 +641,7 @@ class User(object):
                     else:
                         print('回复删除失败')
 
-        time.sleep(5)
+        time.sleep(7)
         mission_list = self.get_missions()
         if len(mission_list) > 0:        
             for mission in mission_list:
@@ -620,7 +661,7 @@ class User(object):
                     rewardWorth = mission['rewardWorth']
 
                     if 'userStageTargetList' in mission:
-                        self.taskInfo(description, '任务已完成，暂时只能手动领取云豆')
+                        self.taskInfo(description, '任务已完成')
                         continue
 
                     reward_result = self.music.reward_obtain(
@@ -754,10 +795,11 @@ class User(object):
             self.sign()
 
         self.yunbei_task()
-        time.sleep(5)
+        time.sleep(3)
         self.get_yunbei()
 
         if self.userType == 4:
+            time.sleep(3)
             self.musician_task()
 
         if self.vipType == 11:
